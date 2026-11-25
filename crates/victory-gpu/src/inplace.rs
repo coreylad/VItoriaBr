@@ -289,6 +289,17 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    // Handles can be recycled after a section is closed. An old cached
+    // view (or a cached refusal) must not be used for the new section.
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(old)) = own.as_mut().and_then(|views| views.remove(&section)) {
+        // write_own holds OWN while using the view, so no writer can still
+        // be using it here.
+        let address = mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: old.base as *mut c_void };
+        if unsafe { mem::UnmapViewOfFile(address) } == 0 {
+            tracing::warn!(section, error = %std::io::Error::last_os_error(), "failed to unmap an old copy-back view");
+        }
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -1227,6 +1238,70 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_section_discards_cached_copy_back_view_and_refusal() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+
+        // Model a recycled handle: the cached view points at an old section,
+        // while the same cache key now identifies a different section.
+        unsafe {
+            let make_section = || {
+                let handle = mem::CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    mem::PAGE_READWRITE | mem::SEC_RESERVE,
+                    0,
+                    K64 as u32,
+                    std::ptr::null(),
+                );
+                assert!(!handle.is_null());
+                handle
+            };
+            let old = make_section();
+            let new = make_section();
+            let old_view = mem::MapViewOfFile(old, mem::FILE_MAP_WRITE, 0, 0, K64);
+            let cached_old_view = mem::MapViewOfFile(old, mem::FILE_MAP_WRITE, 0, 0, K64);
+            let new_view = mem::MapViewOfFile(new, mem::FILE_MAP_WRITE, 0, 0, K64);
+            assert!(!old_view.Value.is_null() && !cached_old_view.Value.is_null() && !new_view.Value.is_null());
+            for view in [old_view.Value, new_view.Value] {
+                assert!(!mem::VirtualAlloc(view, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            }
+            let section = new as usize;
+            title_memory_section(section, K64 as u64, false);
+            title_memory_view(new_view.Value as usize, K64, section, 0);
+            {
+                let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+                own.get_or_insert_with(Default::default).insert(section, Some(Own {
+                    base: cached_old_view.Value as usize,
+                    bytes: K64 as u64,
+                    committed: vec![0],
+                }));
+            }
+
+            title_memory_section(section, K64 as u64, false);
+            assert!(write_own(new_view.Value as usize + 8, &[0x5a]).is_some());
+            assert_eq!(*(new_view.Value as *const u8).add(8), 0x5a);
+            assert_eq!(*(old_view.Value as *const u8).add(8), 0);
+
+            title_memory_section(section, K64 as u64, false);
+            {
+                let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+                own.get_or_insert_with(Default::default).insert(section, None);
+            }
+            title_memory_section(section, K64 as u64, false);
+            assert!(write_own(new_view.Value as usize + 9, &[0xa5]).is_some());
+            assert_eq!(*(new_view.Value as *const u8).add(9), 0xa5);
+
+            title_memory_section(section, K64 as u64, false);
+            views_gone(new_view.Value as usize, K64);
+            views().sections.retain(|s| s.0 != section);
+            assert_ne!(mem::UnmapViewOfFile(old_view), 0);
+            assert_ne!(mem::UnmapViewOfFile(new_view), 0);
+            assert_ne!(CloseHandle(old), 0);
+            assert_ne!(CloseHandle(new), 0);
+        }
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

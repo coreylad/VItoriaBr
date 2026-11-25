@@ -20,9 +20,10 @@
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
-//! groups counted as 64 threads, mesh groups as 128): active records past it
-//! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! groups counted as 64 threads, mesh groups as 128): records that do not
+//! fit run empty, saturating without 32-bit wraparound so a list of thousands
+//! of garbage records cannot run for seconds either. Records are charged in
+//! lane order within each thread group, but groups may charge in any order.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -1361,11 +1362,6 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
-    /// wraparound across >64 huge indexed-draw records (`count = None`), while
-    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
-    /// `StartInstanceLocation`, and custom stride padding, and leaving
-    /// `src_args` untouched.
     /// A window of mesh records clamped ahead: the filled ones come out as
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
@@ -1448,6 +1444,8 @@ void main() {
         }
     }
 
+    /// The budget saturates across multiple groups without wrapping, while
+    /// preserving the other indexed-draw fields and leaving the source intact.
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -1455,7 +1453,7 @@ void main() {
         };
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
-        const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
+        const RECORDS: u32 = 128; // 2 groups of 64: old InterlockedAdd wrapped 2^32 at 64!
         const BUDGET_CAP: u32 = 1 << 27;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
@@ -1531,13 +1529,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1547,7 +1544,11 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert!(
+            kept == [1, 2] || kept == [64, 65],
+            "the first two real draws in the group that charges first must fit: {kept:?}"
+        );
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

@@ -159,6 +159,40 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+#[derive(Default)]
+struct WaitBudget {
+    frame: Option<u64>,
+    spent: Duration,
+}
+
+impl WaitBudget {
+    fn claim(&mut self, frame: u64, budget: Duration, shared: bool) -> Duration {
+        match self.frame {
+            Some(current) if frame < current => return Duration::ZERO,
+            Some(current) if frame == current => {}
+            _ => {
+                self.frame = Some(frame);
+                self.spent = Duration::ZERO;
+            }
+        }
+        let left = budget.saturating_sub(self.spent);
+        if shared {
+            self.spent += left;
+        }
+        left
+    }
+
+    fn finish(&mut self, frame: u64, shared: bool, reserved: Duration, waited: Duration) {
+        if self.frame == Some(frame) {
+            if shared {
+                self.spent = self.spent.saturating_sub(reserved - waited);
+            } else {
+                self.spent += waited;
+            }
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
@@ -167,18 +201,14 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: Mutex<WaitBudget> = Mutex::new(WaitBudget {
+        frame: None,
+        spent: Duration::ZERO,
+    });
     let shared = shared_budget();
     let left = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        spent.claim(frame, budget, shared)
     };
     if left.is_zero() {
         return;
@@ -197,14 +227,7 @@ fn wait(p: &Pending, frame: u64) {
     let waited = started.elapsed().min(left);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
+        spent.finish(frame, shared, left, waited);
     }
     crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
@@ -386,6 +409,33 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_frame_cannot_reset_or_refund_a_newer_frames_wait_budget() {
+        let mut spent = WaitBudget::default();
+        let budget = Duration::from_millis(500);
+        let waited = Duration::from_millis(100);
+        assert_eq!(spent.claim(1, budget, true), budget);
+        assert_eq!(spent.claim(2, budget, true), budget);
+        assert_eq!(spent.claim(1, budget, true), Duration::ZERO);
+        spent.finish(1, true, budget, waited);
+        assert_eq!(spent.claim(2, budget, true), Duration::ZERO);
+        spent.finish(2, true, budget, waited);
+        assert_eq!(spent.claim(2, budget, true), budget - waited);
+    }
+
+    #[test]
+    fn unshared_budget_counts_completed_waits_and_ignores_stale_frames() {
+        let mut spent = WaitBudget::default();
+        let budget = Duration::from_millis(500);
+        let waited = Duration::from_millis(125);
+        assert_eq!(spent.claim(4, budget, false), budget);
+        spent.finish(4, false, budget, waited);
+        assert_eq!(spent.claim(5, budget, false), budget);
+        spent.finish(4, false, budget, waited);
+        assert_eq!(spent.claim(4, budget, false), Duration::ZERO);
+        assert_eq!(spent.claim(5, budget, false), budget);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

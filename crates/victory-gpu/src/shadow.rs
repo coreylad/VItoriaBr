@@ -738,6 +738,21 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len());
+    let (now_chunks, now_tail) = now[..len].as_chunks::<DIFF_CHUNK>();
+    let (held_chunks, held_tail) = held[..len].as_chunks_mut::<DIFF_CHUNK>();
+    let (title_chunks, title_tail) = title[..len].as_chunks_mut::<DIFF_CHUNK>();
+    let mut changed = false;
+    for ((now, held), title) in now_chunks.iter().zip(held_chunks).zip(title_chunks) {
+        if now != held {
+            changed |= merge_bytes(now, held, title);
+        }
+    }
+    changed | merge_bytes(now_tail, held_tail, title_tail)
+}
+
+#[inline]
+fn merge_bytes(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -980,6 +995,40 @@ mod relay_tests {
         let (title1, held1) = (title.clone(), held.clone());
         assert!(!merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
+    }
+
+    #[test]
+    fn chunked_merge_matches_bytewise_merge() {
+        for len in [0, 1, 31, 32, 33, 63, 64, 65, 257] {
+            for stride in [1, 2, 31, 32, 33, 127, 1024] {
+                for title_matches in [false, true] {
+                    let mut held: Vec<u8> = (0..len).map(|i| (i * 13) as u8).collect();
+                    let mut now = held.clone();
+                    for i in (0..len).step_by(stride) {
+                        now[i] ^= 0x7f;
+                    }
+                    let mut title = if title_matches { now.clone() } else { vec![0x42; len] };
+                    let (mut expected_held, mut expected_title) = (held.clone(), title.clone());
+                    let mut changed = false;
+                    for i in 0..len {
+                        if now[i] != expected_held[i] {
+                            changed |= expected_title[i] != now[i];
+                            expected_title[i] = now[i];
+                            expected_held[i] = now[i];
+                        }
+                    }
+                    assert_eq!(merge_piece(&now, &mut held, &mut title), changed);
+                    assert_eq!((held, title), (expected_held, expected_title), "len {len}, stride {stride}");
+                }
+            }
+        }
+        let now = [1; 65];
+        let mut held = [0; 64];
+        let mut title = [0; 33];
+        assert!(merge_piece(&now, &mut held, &mut title));
+        assert_eq!(&held[..33], &[1; 33]);
+        assert_eq!(&held[33..], &[0; 31]);
+        assert_eq!(title, [1; 33]);
     }
 
     #[test]

@@ -130,6 +130,7 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 - **`VICTORY_QUEUE2=1` + `VICTORY_ASYNC_SUBMIT=1` + `VICTORY_COPY_PLAIN=1`:** corta `copying back` em **~3×** (`~205 ms → ~65–78 ms`) usando a Copy Queue dedicada, executa ~12.400 cópias in-place/frame (`~290 MB/frame`) sem syscall do kernel e derruba `textures` pela metade (`~40 ms → ~20 ms`).
 - **`VICTORY_AMBIENT=0.6` (padrão):** ativa o pass de iluminação ambiente com sombreamento por profundidade (portado de `Belobug/VIctory-Belobug-AMD`, GPL-3.0), mantendo personagens, pele, veículos, água e interiores totalmente iluminados enquanto o RTGI completo ainda não roda. Use `0` para desligar.
 - **`VICTORY_TEXTURE_NO_WAIT=1`**: elimina stalls de lock na leitura de memória do título durante refresh de texturas (`textures` cai de `900–3.700 ms` para `6–25 ms`).
+- A fila alterna novas texturas e tentativas para evitar que uma classe fique sem atendimento; `VICTORY_TEXTURE_FAIR_QUEUE=0` restaura a ordem anterior. Inspirado em [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/5f4c3df44197eb03b82205d2da871ded8d0ccf16).
 - **`VICTORY_DISPLAY_MODE=1920x1080`**: reduz a resolução interna de renderização mesmo em monitores 4K (a janela apenas faz upscale barato no `Present`).
 - **`VICTORY_CARD_FETCH_INFLIGHT` (deixar desligado / `0`)**: ligá-lo derruba `copying back` de `~162 ms` para `~45 ms`, mas sobrecarrega a GPU (`on the GPU` sobe de `~50–65 ms` para `~200–330 ms`), reduzindo o FPS total na RTX 5060 Ti (`1.9–2.6 fps` vs `3.5–6.0 fps`).
 - **`VICTORY_BVH_BUILDER=1` (RTGI — experimental)**: atinge **50/53** compute shaders em wave32; os 3 faltantes (`39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`) falham em `v_readfirstlane_b32` sob divergência. Com `VICTORY_FIRSTLANE_OWN=1` o builder chega a **53/53** e ativa, mas o atalho corrompe offsets de AABB na memória (crash após ~18 s) — manter desligado até a troca completa entre metades da wave64.
@@ -248,6 +249,8 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 ```
 
 > **Tuning notes (RTX 5060 Ti & 8 GB GPUs):** Use `VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_TEXTURE_BUDGET_MB=10240` on 16 GB GPUs (`1024` / `5120` on 8 GB GPUs) together with `VICTORY_PAGE_WRITES=slots` to prevent `the card has no room for new ones` and re-upload late-written placed textures (fixing black skin and ground). Enabling `VICTORY_QUEUE2=1`, `VICTORY_ASYNC_SUBMIT=1`, and `VICTORY_COPY_PLAIN=1` cuts `copying back` by ~3× (`~205 → ~65–78 ms`) and handles ~12,400 in-place copies/frame without kernel syscalls. Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default). `VICTORY_BVH_BUILDER=1` reaches `50/53` compute shaders on wave32 (missing 3 `v_readfirstlane_b32` scans: `39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`); leave `VICTORY_FIRSTLANE_OWN` off for now.
+
+Texture passes alternate new uploads and retries to prevent starvation. Set `VICTORY_TEXTURE_FAIR_QUEUE=0` for the previous ordering. Inspired by [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/5f4c3df44197eb03b82205d2da871ded8d0ccf16).
 
 Diagnostics build:
 ```powershell

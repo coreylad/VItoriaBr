@@ -564,6 +564,8 @@ struct Waiting {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    fresh_first: std::cell::Cell<bool>,
+    oldest_first: std::cell::Cell<bool>,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
@@ -590,15 +592,25 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
+    /// - alternate those looked at before with first looks, so retries
+    ///   cannot starve new textures;
+    /// - among first looks, take the newest write and the oldest in turns:
+    ///   slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    ///   first 3D frames). `VICTORY_TEXTURE_FAIR_QUEUE=0` restores the
+    ///   retries-first order.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        static FAIR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fair = *FAIR.get_or_init(|| {
+            let fair = std::env::var_os("VICTORY_TEXTURE_FAIR_QUEUE").is_none_or(|v| v != "0");
+            tracing::info!(fair, "texture retries and first uploads share each pass (VICTORY_TEXTURE_FAIR_QUEUE)");
+            fair
+        });
+        self.due_order(frame, max, fair)
+    }
+
+    fn due_order(&self, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -609,17 +621,37 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let mut retry = 0;
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut first_fresh = fair && self.fresh_first.get();
+        if fair && max > 0 && !again.is_empty() && !fresh.is_empty() {
+            self.fresh_first.set(!first_fresh);
+        }
+        let mut newest = !fair || !self.oldest_first.get();
+        if fair && max > 0 && !fresh.is_empty() && (first_fresh || again.is_empty()) {
+            self.oldest_first.set(!self.oldest_first.get());
+        }
+        while order.len() < max && (retry < again.len() || new < old) {
+            if retry < again.len() && (!first_fresh || new == old) {
+                order.push((again[retry].1, again[retry].2));
+                retry += 1;
+            } else {
+                let i = if newest {
+                    let i = new;
+                    new += 1;
+                    i
+                } else {
+                    old -= 1;
+                    old
+                };
+                order.push((fresh[i].1, fresh[i].2));
+                newest = !newest;
+            }
+            if fair {
+                first_fresh = !first_fresh;
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -3311,8 +3343,7 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
+    /// The queue serves the newest and oldest fresh writes in turns; a
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
@@ -3337,8 +3368,8 @@ mod tests {
             q.later(17, w17, frame, 4);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
-            // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            // Due again, alongside slots never looked at.
+            assert!(q.due(frame, 100)[..2].iter().any(|d| d.0 == 17));
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
@@ -3347,14 +3378,14 @@ mod tests {
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert!(q.due(12, 100)[..2].iter().any(|d| d.0 == 16));
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert!(q.due(13, 100).iter().any(|d| d.0 == 16));
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -3367,6 +3398,39 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn new_textures_are_served_even_when_retries_fill_the_pass() {
+        let mut q = TextureQueue::default();
+        for index in 0..5 {
+            q.written(index, 0, 0, false);
+            let write = q.slots[&index].write;
+            q.later(index, write, 0, 1);
+        }
+        q.written(10, 0, 0, false);
+        q.written(11, 0, 0, false);
+        assert!(q.due_order(1, 0, true).is_empty());
+        assert!(q.due_order(1, 1, true)[0].0 < 5);
+        assert_eq!(q.due_order(1, 1, true)[0].0, 11);
+        assert!(q.due_order(1, 1, true)[0].0 < 5);
+        assert_eq!(q.due_order(1, 1, true)[0].0, 10);
+        let legacy: Vec<u32> = q.due_order(1, 20, false).iter().map(|entry| entry.0).collect();
+        assert_eq!(legacy, [4, 3, 2, 1, 0, 11, 10]);
+        let all = q.due_order(1, 20, true);
+        assert_eq!(all.len(), 7);
+        assert!(all.iter().any(|entry| entry.0 == 10));
+        assert!(all.iter().any(|entry| entry.0 == 11));
+    }
+
+    #[test]
+    fn single_texture_passes_serve_old_and_new_writes() {
+        let mut q = TextureQueue::default();
+        q.written(10, 0, 0, false);
+        q.written(11, 0, 0, false);
+        assert_eq!(q.due_order(1, 1, true)[0].0, 11);
+        assert!(q.due_order(1, 0, true).is_empty());
+        assert_eq!(q.due_order(1, 1, true)[0].0, 10);
     }
 
     /// Slots held back for lack of room on the card are not handed out
