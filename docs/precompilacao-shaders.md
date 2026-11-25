@@ -206,6 +206,10 @@ not strip `WaveSize(64)`, change thread-group sizes, or enable experimental
 wave widening. Such a refusal is an unresolved compatibility gap, not a
 successful warm-up or a guarantee of complete rendering.
 
+`VICTORY_WAVE_WIDE=0` keeps experimental wave64 branch widening disabled.
+Native-wave32 branch retries remain enabled: they stay within one host
+wave and do not add cross-warp group barriers.
+
 D3D12 message 971 (`Load*Pipeline`: no pipeline stored with this name) is
 an expected library miss before normal pipeline creation. It is separate
 from an unsupported shader wave width or a failed PSO.

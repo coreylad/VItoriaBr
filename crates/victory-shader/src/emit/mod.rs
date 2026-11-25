@@ -535,11 +535,12 @@ fn emit_attempts(
     // Cross-lane code that needs every lane of the console wave where it
     // stands (a mask operation, a lane read, a first-lane read): right once
     // the wave takes the per-lane branches around it together ([`widen`];
-    // the lowering has named the blocks that could not meet).
+    // the lowering has named the blocks that could not meet). Native wave32
+    // retries need no cross-warp barriers; only wave64 widening is opt-in.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if needs_wave_wide(native.stage, what)
-                && wide_on =>
+                && (wide_on || !native.wave64) =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {

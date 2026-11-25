@@ -803,7 +803,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         0x38 << 26 | 0x1C << 18,
         0x80 << 24 | 2 << 16 | 5 << 8, // buffer_store_dword v5, off, s[8:11], 0
     ];
-    let native = native_of(&words, false, 32);
+    let native = native_of(&words, false, 128);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let branch = (0..p.blocks.len())
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
@@ -817,11 +817,23 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     );
     let st = structure::structure(&p).expect("structure");
     assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
-    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
+    let shader = emitted_on(&native, 32, false)
+        .expect("native wave32 retries remain enabled without two-warp widening");
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    for offset in [20, 24] {
+        assert_eq!(u32::from_le_bytes(psv[offset..offset + 4].try_into().unwrap()), 32);
     }
+    let mut wave64_words = words;
+    wave64_words[1] = 0xBE8C_246A; // s_and_saveexec_b64 s[12:13], vcc
+    wave64_words[4] = 0xBEFE_040C; // s_mov_b64 exec, s[12:13]
+    let wave64 = native_of(&wave64_words, true, 64);
+    assert!(matches!(
+        emitted_on(&wave64, 32, false),
+        Err(ShaderError::Unsupported { what: lower::LANE_MASK, .. })
+    ), "the same retry across two warps must stay opt-in");
+    emitted_on(&wave64, 32, true).expect("two-warp retry when explicitly enabled");
+
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // (lanes below s0 inside, s1) -> what lane 31 stores: 2 if SCC was set at the branch
     for (below, s1, expected) in [(0u32, 7u32, 1u32), (10, 7, 2), (10, 3, 1), (32, 3, 1), (32, 7, 2)] {
