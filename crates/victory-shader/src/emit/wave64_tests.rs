@@ -551,6 +551,204 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+fn emitted(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+    emitted_on(native, 32, true)
+}
+
+fn emitted_on(native: &NativeProgram, host_wave: u32, wide: bool) -> Result<HostShader, ShaderError> {
+    struct Wave(Option<u32>);
+    impl Drop for Wave {
+        fn drop(&mut self) {
+            lower::TEST_HOST_WAVE.set(self.0);
+        }
+    }
+    let _wave = Wave(lower::TEST_HOST_WAVE.replace(Some(host_wave)));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let io = io::raise(&p, native).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&bytes).unwrap();
+    let mut shader = super::emit_with_wide(&c, native, &p, &st, &io, &res, wide)?;
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+    validator.validate(&mut shader.dxil).unwrap();
+    Ok(shader)
+}
+
+#[test]
+fn wave32_target_refuses_a_remaining_native_wave64_requirement() {
+    let mut native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xBE87_03FF, 999, // s_mov_b32 s7, 999
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz: restore EXEC
+        0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+        0xD8D8_0000, 0x0300_0001, // ds_read_b32 v3, v1
+        0x7E0E_0503, // v_readfirstlane_b32 s7, v3
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xE070_1000, 0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0xE070_1100, 0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen offset:256
+    ]);
+    let StageIo::Cs(ref mut cs) = native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15;
+    emitted_on(&native, 64, false).expect("native wave64 remains supported on a wave64 target");
+    let result = emitted_on(&native, 32, false);
+    assert!(matches!(
+        &result,
+        Err(ShaderError::Unsupported {
+            what: "a native wave64 shader after wave32 translation retries; cross-half synchronization is not supported",
+            ..
+        })
+    ), "{}", result.err().map_or_else(|| "translation unexpectedly succeeded".to_owned(), |e| e.to_string()));
+}
+
+#[test]
+fn wave32_target_keeps_exact_cross_half_reads_without_wave_widening() {
+    let native = native(&[
+        0xD760_0007, 0x0001_4100, // v_readlane_b32 s7, v0, 32
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let shader = emitted_on(&native, 32, false)
+        .expect("uniform cross-half emulation remains supported");
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    for offset in [20, 24] {
+        assert_eq!(u32::from_le_bytes(psv[offset..offset + 4].try_into().unwrap()), 32);
+    }
+    if let Ok(host) = Host::new(false) {
+        host.compute_pipeline(&shader).expect("wave32 hardware PSO, never dispatched");
+    } else {
+        eprintln!("no hardware device; PSO creation not checked");
+    }
+}
+
+#[test]
+fn two_warp_shared_memory_and_first_lane_reads_match_all_64_lanes() {
+    let mut native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xBE87_03FF, 999, // s_mov_b32 s7, 999
+        0x4A08_0001, // v_add_nc_u32 v4, s1, v0
+        0x3608_08BF, // v_and_b32 v4, 63, v4
+        0x7D88_0800, // v_cmp_gt_u32 vcc, s0, v4
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz: restore EXEC
+        0x4A04_00FF, 1000, // v_add_nc_u32 v2, 1000, v0
+        0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+        0x4A08_00A0, // v_add_nc_u32 v4, 32, v0
+        0x3608_08BF, // v_and_b32 v4, 63, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000, 0x0300_0004, // ds_read_b32 v3, v4
+        0x7E0E_0503, // v_readfirstlane_b32 s7, v3
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xE070_1000, 0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xE070_1100, 0x8002_0204, // buffer_store_dword v2, v4, s[8:11], 0 offen offset:256
+    ]);
+    let StageIo::Cs(ref mut cs) = native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15; // 512 bytes of console LDS
+    let shader = emitted(&native).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 hardware pipeline");
+    for (below, flip) in [0u32, 1, 31, 32, 33, 63, 64].into_iter().flat_map(|n| [(n, 0), (n, 32)]) {
+        let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                constants[u.index as usize] = [below, flip][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(65)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        let active = |lane| (lane + flip) % 64 < below;
+        let read = |lane| {
+            let partner = (lane + 32) % 64;
+            partner + if active(partner) { 1000 } else { 0 }
+        };
+        for lane in 0..64u32 {
+            assert_eq!(out[0][lane as usize], if active(lane) { read(lane) } else { 0 }, "lane {lane}, below {below}, flip {flip}");
+        }
+        let first = (0..64).find(|&lane| active(lane));
+        assert_eq!(out[0][64], first.map_or(999, read), "first lane, below {below}, flip {flip}");
+    }
+}
+
+#[test]
+fn two_warp_retry_refuses_unsafe_multi_wave_groups_instead_of_approximating() {
+    let native = native_of(&[
+        0xBE87_03FF, 999, // s_mov_b32 s7, 999
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz: restore EXEC
+        0xD760_0007, 0x0001_4100, // v_readlane_b32 s7, v0, 32
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+    ], true, 128);
+    let result = emitted(&native);
+    assert!(matches!(
+        &result,
+        Err(ShaderError::Unsupported {
+            what: "wave-wide branches in a thread group of several console waves",
+            ..
+        })
+    ), "{}", result.err().map_or_else(|| "translation unexpectedly succeeded".to_owned(), |e| e.to_string()));
+}
+
+#[test]
+fn two_warp_synchronization_includes_divergent_returns_and_loop_aborts() {
+    let native = native(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz: skip the loop
+        0xBF82_FFFF, // s_branch: loop until the host iteration limit
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let needs = lower::barrier_needs(&p, &st).unwrap();
+    let latch = p.blocks.iter().position(|b| matches!(b.exit, ir::Exit::Jump(t) if p.blocks[t].offset <= b.offset)).unwrap();
+    assert!(needs.contains(&latch), "a per-lane loop-limit return must reconverge");
+    let branches = lower::branches_around(&st, &needs).unwrap();
+    assert!(!branches.is_empty());
+    let wide = structure::structure_wide(&p, &branches.into_iter().collect()).unwrap();
+    assert!(lower::barrier_needs(&p, &wide).unwrap().is_empty());
+
+    let native = native_of(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz: the other return
+        S_ENDPGM,
+    ], true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let needs = lower::barrier_needs(&p, &st).unwrap();
+    assert!(needs.iter().any(|&b| st.exits[b] == structure::LaneExit::End));
+    let branches = lower::branches_around(&st, &needs).unwrap();
+    let wide = structure::structure_wide(&p, &branches.into_iter().collect()).unwrap();
+    assert!(lower::barrier_needs(&p, &wide).unwrap().is_empty());
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack

@@ -342,7 +342,34 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section(HANDLE, Mutex<Vec<u64>>);
+
+impl Section {
+    fn commit(&self, base: usize, first: usize, pages: usize) -> bool {
+        if on_wine() {
+            return true;
+        }
+        let mut committed = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        let end = first + pages;
+        let masks = || (first / 64..end.div_ceil(64)).map(|word| {
+            let lo = first.saturating_sub(word * 64);
+            let hi = (end - word * 64).min(64);
+            (word, (u64::MAX << lo) & (u64::MAX >> (64 - hi)))
+        });
+        if masks().all(|(word, mask)| committed[word] & mask == mask) {
+            return true;
+        }
+        if !commit(base, pages * PAGE) {
+            return false;
+        }
+        // SEC_RESERVE commitment belongs to the section, not the view,
+        // and cannot be decommitted until the section itself is destroyed.
+        for (word, mask) in masks() {
+            committed[word] |= mask;
+        }
+        true
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -444,7 +471,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, Mutex::new(vec![0; n.div_ceil(64)])));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -505,7 +532,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        slice.section.commit(at.Value as usize, slice.index, n).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -860,7 +887,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.commit(base, slice.index, len / PAGE) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1205,6 +1232,37 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn section_commitment_survives_views_and_concurrent_aliases() {
+        let mut pages = [0usize; 130];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let slice = physical().pages[&pages[0]].clone();
+        let middle = Slice { index: 63, ..slice.clone() };
+        {
+            let mut view = View::map(&middle, 3).expect("commit across bitmap words");
+            view.bytes().fill(0x5a);
+        }
+        std::thread::scope(|scope| {
+            for i in [0, 64, 128] {
+                let slice = Slice { index: i, ..slice.clone() };
+                scope.spawn(move || {
+                    let mut view = View::map(&slice, 2).expect("overlapping commitment through a new alias");
+                    view.bytes()[0] = (i + 1) as u8;
+                });
+            }
+        });
+        let mut whole = View::map(&slice, pages.len()).expect("commit the remaining pages");
+        for i in [0, 64, 128] {
+            assert_eq!(whole.bytes()[i * PAGE], (i + 1) as u8);
+        }
+        assert!(whole.bytes()[63 * PAGE..64 * PAGE].iter().all(|&b| b == 0x5a));
+        assert!(whole.bytes()[64 * PAGE + 1..66 * PAGE].iter().all(|&b| b == 0x5a));
+        assert!(whole.bytes()[66 * PAGE..128 * PAGE].iter().all(|&b| b == 0));
+        drop(whole);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     #[test]

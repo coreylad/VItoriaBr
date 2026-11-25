@@ -93,24 +93,25 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
-    /// Translate every shader found into the shader cache ahead of a run,
-    /// so the first run reads them from the cache instead of translating
-    /// them while the title waits. Run it with the same build and
-    /// VICTORY_* settings as the title (including `VICTORY_HOST_WAVE` and
-    /// `VICTORY_VIEW_LIMIT` when matching the host run's log). Defaults to
-    /// the configured game and test-title directories.
+    /// Cache shader translations and compile compute pipelines ahead of a run.
+    /// Graphics pipelines still need the title's draw state. Use the same build
+    /// and VICTORY_* settings as the title. Defaults to configured title paths.
     Warm {
         paths: Vec<PathBuf>,
         /// Print each shader that does not translate.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Worker threads (default: up to four).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Cache translations only, without compiling host compute pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        exe: PathBuf,
+        /// Defaults to [paths].game_exe or VICTORY_GAME_EXE.
+        exe: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -145,7 +146,16 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
+    let config = victory_core::Config::load()?;
+    // SAFETY: no logging, runtime, or helper threads have been started yet.
+    unsafe { config.apply_environment()? };
+    victory_core::logging::init("info", config.log_dir.as_deref())?;
+    tracing::info!(
+        config = ?config.source,
+        log_dir = ?config.log_dir,
+        shader_cache = %config.shader_cache_dir.display(),
+        "runtime configuration loaded"
+    );
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -183,9 +193,9 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, list, jobs } => {
+        Command::Warm { paths, list, jobs, no_pipelines } => {
             apply_host_shader_overrides_from_env();
-            warm::run(paths, list, jobs)
+            warm::run(paths, list, jobs, !no_pipelines)
         }
         Command::Run {
             exe,
@@ -194,7 +204,12 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let exe = exe
+                .as_deref()
+                .map_or_else(|| config.require_game_exe(), Ok)?;
+            run::run(exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
@@ -213,8 +228,15 @@ fn show_config() -> Result<()> {
             .map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("game_exe    : {}", status(&cfg.game_exe));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("shader_cache: {}", cfg.shader_cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("log_dir     : {}", status(&cfg.log_dir));
+    println!(
+        "environment : {} file defaults (inherited environment overrides)",
+        cfg.environment.len()
+    );
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -222,7 +244,9 @@ fn show_config() -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir, &cfg.data_dir])
+        .chain(&cfg.game_exe)
+        .chain([&cfg.cache_dir, &cfg.shader_cache_dir, &cfg.data_dir])
+        .chain(&cfg.log_dir)
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");

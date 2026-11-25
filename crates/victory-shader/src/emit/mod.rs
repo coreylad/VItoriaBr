@@ -348,6 +348,39 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+    emit_with_wide(c, native, p, st, io, res, wide_on)
+}
+
+fn emit_with_wide(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    wide_on: bool,
+) -> Result<HostShader, ShaderError> {
+    let (shader, wave) = emit_attempts(c, native, p, st, io, res, wide_on)?;
+    let max = lower::host_max_wave();
+    if max != 0 && wave.is_some_and(|required| required > max) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a native wave64 shader after wave32 translation retries; cross-half synchronization is not supported",
+        });
+    }
+    Ok(shader)
+}
+
+fn emit_attempts(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    wide_on: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -412,16 +445,13 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Two warps share one console wave. The retry also reconverges LDS accesses,
+        // early returns and loop-limit returns so neither warp leaves a barrier behind.
+        // Groups containing several console waves are rejected by `widen`.
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -437,7 +467,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -453,9 +483,7 @@ pub fn emit(
                     if let Some(base) = bases.into_iter().flatten().next() {
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
+                        return again;
                     }
                 }
                 if strict {
@@ -472,7 +500,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -480,7 +508,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -492,14 +520,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -511,7 +539,7 @@ pub fn emit(
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if needs_wave_wide(native.stage, what)
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+                && wide_on =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
@@ -521,7 +549,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -535,7 +562,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// Whether a refusal is of cross-lane code that the wave-wide retry can fix:
@@ -581,12 +608,23 @@ fn widen(
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
-        let needs = lower::take_needs();
+        let mut needs = lower::take_needs();
+        let synchronization = if native.wave64 && lower::host_max_wave() == 32 {
+            lower::barrier_needs(p, &st).ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "two-warp synchronization through an indirect exit",
+            })?
+        } else {
+            Vec::new()
+        };
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
+        let unsafe_sync = !synchronization.is_empty();
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty()
+            || r.is_ok() && unsafe_sync;
+        needs.extend(synchronization);
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
@@ -602,7 +640,13 @@ fn widen(
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
-            return r;
+            return match r {
+                Ok(_) if unsafe_sync => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "two-warp synchronization with divergent returns or shared-memory accesses",
+                }),
+                other => other,
+            };
         }
         wide.extend(more);
     }

@@ -106,15 +106,21 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit headroom in bytes.
+pub(crate) fn available_memory() -> Option<[u64; 2]> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    if !ok {
+        let error = std::io::Error::last_os_error();
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| tracing::warn!(%error, "cannot query system memory pressure"));
+        return None;
+    }
+    Some([m.ullAvailPhys, m.ullAvailPageFile])
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -142,21 +148,33 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
-pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+/// when physical RAM or commit headroom is low. Never returns less than 2,000 ms.
+pub(crate) fn ram_idle_ms(memory: Option<[u64; 2]>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
+    let Some([physical, commit]) = memory else {
         return NORMAL_MS;
     };
+    let avail = physical.min(commit);
     if avail < 2 * GIB {
         HIGH_MS
     } else if avail < 4 * GIB {
         MODERATE_MS
     } else {
         NORMAL_MS
+    }
+}
+
+/// Only unused buffers enter these pools; required rendering allocations
+/// are not capped by this budget.
+pub(crate) fn spare_budget(memory: Option<[u64; 2]>, normal: u64) -> u64 {
+    const GIB: u64 = 1 << 30;
+    match memory.map(|[physical, commit]| physical.min(commit)) {
+        Some(available) if available < 2 * GIB => 0,
+        Some(available) if available < 4 * GIB => normal / 4,
+        _ => normal,
     }
 }
 
@@ -202,6 +220,9 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    let memory = available_memory();
+    crate::shadow::trim_spares(spare_budget(memory, 512 << 20) as usize);
+    crate::texture::trim_spares(spare_budget(memory, 256 << 20));
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -310,10 +331,10 @@ pub(crate) fn removal_context() -> String {
     let now = now_us();
     let ms = |at: u64| now.saturating_sub(at) as f64 / 1000.0;
     let phase = match SUBMITTING[0].load(Ordering::Relaxed) {
-        0 => "between submissions (nothing of ours was running on the card)",
-        1 => "preparing a submission (nothing of ours was running on the card)",
+        0 => "between submissions",
+        1 => "preparing a submission",
         2 => "waiting for the card to run a submission",
-        _ => "copying back what a submission wrote (nothing of ours was running on the card)",
+        _ => "copying back what a submission wrote",
     };
     let mut text = format!(
         "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
@@ -623,11 +644,16 @@ fn create() -> windows::core::Result<Host> {
         // faulting address), read when the device is removed.
         if dred_on() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            match D3D12GetDebugInterface(&mut dred) {
+                Ok(()) => match dred {
+                    Some(dred) => {
+                        dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        tracing::info!("GPU device-removal breadcrumbs and page-fault reporting enabled");
+                    }
+                    None => tracing::warn!("D3D12 returned no device-removal settings interface"),
+                },
+                Err(e) => tracing::warn!(error = %e, "could not enable GPU device-removal diagnostics"),
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -669,7 +695,21 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            let requested = std::env::var("VICTORY_HOST_WAVE");
+            let requested = match &requested {
+                Ok(value) => Some(value.as_str()),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(e) => return Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x80070057u32 as i32),
+                    format!("VICTORY_HOST_WAVE: {e}"),
+                )),
+            };
+            let target = target_wave(o1.WaveLaneCountMin, o1.WaveLaneCountMax, requested)
+                .map_err(|e| windows::core::Error::new(
+                    windows::core::HRESULT(0x80070057u32 as i32), e,
+                ))?;
+            tracing::info!(lanes = target, "translator wave cap");
+            victory_shader::emit::set_host_max_wave(target);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -739,8 +779,34 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+fn target_wave(min: u32, max: u32, requested: Option<&str>) -> Result<u32, &'static str> {
+    let Some(requested) = requested else { return Ok(max) };
+    let lanes = requested.trim().parse::<u32>().ok()
+        .filter(|n| matches!(n, 32 | 64))
+        .ok_or("VICTORY_HOST_WAVE must be 32 or 64")?;
+    if max == 0 {
+        return Err("VICTORY_HOST_WAVE requires a GPU with reported wave support");
+    }
+    if lanes < min {
+        return Err("VICTORY_HOST_WAVE is below the GPU's minimum wave width");
+    }
+    Ok(lanes.min(max))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_wave_cap_cannot_exceed_hardware_or_require_an_unsupported_width() {
+        assert_eq!(super::target_wave(32, 64, Some("32")), Ok(32));
+        assert_eq!(super::target_wave(32, 32, Some("64")), Ok(32));
+        assert_eq!(super::target_wave(32, 64, None), Ok(64));
+        assert!(super::target_wave(64, 64, Some("32")).is_err());
+        assert!(super::target_wave(0, 0, Some("32")).is_err());
+        for invalid in ["0", "16", "33", "bad"] {
+            assert!(super::target_wave(32, 64, Some(invalid)).is_err());
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1311,7 +1377,11 @@ fn record_twin_copy(
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        let requested = std::env::var_os("VICTORY_D3D12_DRED").is_some();
+        if requested && !cfg!(feature = "diagnostics") {
+            tracing::warn!("VICTORY_D3D12_DRED requires a build with --features diagnostics; GPU command breadcrumbs are not enabled");
+        }
+        cfg!(feature = "diagnostics") && requested
     })
 }
 
@@ -2547,89 +2617,70 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
-    for list in runs {
-        for step in &list.deferred().copies {
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
-                        // A copy that only READS where flights may write is
-                        // not waited for either, and checked like a fill
-                        // (`fill_ahead`): run 210 looked at 197 such waits
-                        // (20,480 bytes out of the 174 MB buffer into a small
-                        // buffer of its own, four a frame, 43 to 60 ms a
-                        // frame) and neither side had other bytes after
-                        // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
-                            if count {
-                                fill_ahead::read(src, len);
-                            }
-                            continue;
-                        }
+    let read_ahead = fill_ahead::on();
+    runs.iter().find_map(|list| blocked_steps(written, &list.deferred().copies, count, read_ahead))
+}
+
+fn blocked_steps(
+    written: &[(usize, usize)],
+    steps: &[Step],
+    count: bool,
+    read_ahead: bool,
+) -> Option<usize> {
+    for step in steps {
+        match step {
+            &Step::Copy(dst, src, len) => {
+                if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    // Speculation never bypasses a write dependency.
+                    if !touches(written, dst, dst + len) && read_ahead {
                         if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            fill_check::blocked_copy(written, dst, src, len);
+                            fill_ahead::read(src, len);
                         }
-                        return Some(WHY_READ);
+                        continue;
                     }
-                }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
-                        // Not waited for, and checked when the flights land
-                        // (`fill_ahead`).
-                        if fill_ahead::on() {
-                            if count {
-                                fill_ahead::read(src, len);
-                            }
-                            continue;
-                        }
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            fill_check::blocked(written, src, len);
-                        }
-                        return Some(WHY_READ);
+                    if count {
+                        LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        fill_check::blocked_copy(written, dst, src, len);
                     }
+                    return Some(WHY_READ);
                 }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
+            &Step::Fill(_, src, len) => {
+                if touches(written, src, src + len) {
+                    if read_ahead {
+                        if count {
+                            fill_ahead::read(src, len);
+                        }
+                        continue;
+                    }
+                    if count {
+                        LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        fill_check::blocked(written, src, len);
+                    }
+                    return Some(WHY_READ);
+                }
+            }
+            Step::Texture(staging) => {
+                let (at, len) = staging.memory();
+                if touches(written, at, at + len) {
+                    if count {
+                        LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(WHY_READ);
+                }
+            }
+            Step::Run(_) => return Some(WHY_RUN),
+            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
     None
 }
 
-/// Fills of upload memory (a constant buffer a table names, copied into
-/// the list's own memory when the list is submitted) that read title memory
-/// flights "may write" are no longer waited for; what the flights then
-/// write is checked against them, and the first fill that read bytes a
-/// flight changed afterwards turns the waiting back on for good.
-///
-/// Why: a flight declares every range its shaders can store to, and the
-/// title has an unordered view over the whole of its 174 MB buffer, whose
-/// copy is in the card's memory. Its per-draw constants lie in the same
-/// buffer, at new addresses every frame. So the first such fill of a frame
-/// waited until those flights had landed: one wait a frame, 56 to 95 ms of
-/// the submitting thread standing still (runs 202 and 206; 145 ms while
-/// the world loaded in 208), the largest single wait of the frame. Run 208
-/// looked at every one of them: 44 fills of 480 bytes, and after the wait
-/// the bytes were the same 44 times.
-///
-/// What it risks, and how it is bounded: a fill that reads bytes a flight
-/// in the air is about to change takes the old bytes, and the lists of
-/// that one submission draw with them. `wrote` sees it when the flight
-/// lands (the bytes going into title memory are compared with the ones
-/// there, over every fill that read ahead of them) and from then on fills
-/// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+/// Overlapping upload reads wait for GPU writes by default. The opt-in
+/// `VICTORY_FILL_WAIT=0` experiment reads ahead and detects stale data only
+/// after the affected draw has already used it; detection cannot repair it.
 mod fill_ahead {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -2674,7 +2725,17 @@ mod fill_ahead {
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        *ON.get_or_init(|| {
+            let enabled = configured(std::env::var_os("VICTORY_FILL_WAIT").as_deref());
+            if enabled {
+                tracing::warn!("VICTORY_FILL_WAIT=0 permits uploads to consume stale GPU-written data; dependency waits are recommended");
+            }
+            enabled
+        }) && !WAIT.load(Relaxed)
+    }
+
+    pub(super) fn configured(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|v| v == "0")
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2700,7 +2761,7 @@ mod fill_ahead {
     /// A landing is about to put `new` into title memory at `at`: bytes
     /// shaders wrote, merged into the title's.
     pub(crate) fn wrote(at: usize, new: &[u8]) {
-        if new.is_empty() || WAIT.load(Relaxed) {
+        if new.is_empty() || !on() {
             return;
         }
         let frame = crate::frame::current();
@@ -8416,17 +8477,72 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn ram_idle_ms_scales_with_pressure() {
         use super::ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
-        // Normal (>= 4 GiB)
-        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
-        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
-        // Moderate (2 GiB..4 GiB)
-        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
-        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
-        // High (< 2 GiB)
-        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
-        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        for (available, expected) in [
+            (8 * gib, 10_000),
+            (4 * gib, 10_000),
+            (4 * gib - 1, 5_000),
+            (2 * gib, 5_000),
+            (2 * gib - 1, 2_000),
+            (0, 2_000),
+        ] {
+            assert_eq!(ram_idle_ms(Some([available, 8 * gib])), expected);
+            assert_eq!(ram_idle_ms(Some([8 * gib, available])), expected);
+        }
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn upload_dependencies_wait_by_default_without_serializing_independent_ranges() {
+        let written = [(0x1000, 0x2000)];
+        for value in [None, Some(std::ffi::OsStr::new("1"))] {
+            let ahead = super::fill_ahead::configured(value);
+            for step in [
+                super::Step::Fill(0, 0x1100, 0x100),
+                super::Step::Copy(0x4000, 0x1100, 0x100),
+            ] {
+                assert_eq!(
+                    super::blocked_steps(&written, &[step], false, ahead),
+                    Some(super::WHY_READ)
+                );
+            }
+            let independent = [
+                super::Step::Fill(0, 0x2000, 0x100),
+                super::Step::Copy(0x4000, 0x3000, 0x100),
+            ];
+            assert_eq!(super::blocked_steps(&written, &independent, false, ahead), None);
+        }
+    }
+
+    #[test]
+    fn explicit_upload_speculation_never_bypasses_a_destination_dependency() {
+        let written = [(0x1000, 0x2000)];
+        let ahead = super::fill_ahead::configured(Some(std::ffi::OsStr::new("0")));
+        assert_eq!(
+            super::blocked_steps(&written, &[super::Step::Fill(0, 0x1100, 0x100)], false, ahead),
+            None
+        );
+        assert_eq!(
+            super::blocked_steps(&written, &[super::Step::Copy(0x1100, 0x4000, 0x100)], false, ahead),
+            Some(super::WHY_READ)
+        );
+    }
+
+    #[test]
+    fn spare_budget_releases_unused_buffers_under_commit_or_physical_pressure() {
+        let gib = 1 << 30;
+        let normal = 256 << 20;
+        for (available, expected) in [
+            (0, 0),
+            (2 * gib - 1, 0),
+            (2 * gib, normal / 4),
+            (4 * gib - 1, normal / 4),
+            (4 * gib, normal),
+        ] {
+            assert_eq!(super::spare_budget(Some([8 * gib, available]), normal), expected);
+            assert_eq!(super::spare_budget(Some([available, 8 * gib]), normal), expected);
+        }
+        assert_eq!(super::spare_budget(None, normal), normal);
     }
 }
 

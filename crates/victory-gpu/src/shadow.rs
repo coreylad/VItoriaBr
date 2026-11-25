@@ -1211,20 +1211,45 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Returns a snapshot buffer to the pool, within the current memory budget.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let budget = crate::host::spare_budget(crate::host::available_memory(), 512 << 20) as usize;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
+    trim_pool(&mut pool, budget);
+}
+
+fn trim_pool(pool: &mut Vec<Vec<u8>>, budget: usize) {
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
+    let (mut kept, mut total) = (0, 0usize);
     pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        let fits = kept < 8 && v.capacity() <= budget - total;
+        if fits {
+            kept += 1;
+            total += v.capacity();
+        }
+        fits
     });
+}
+
+pub(crate) fn trim_spares(budget: usize) {
+    trim_pool(&mut POOL.lock().unwrap_or_else(|e| e.into_inner()), budget);
+}
+
+#[cfg(test)]
+mod spare_tests {
+    #[test]
+    fn spare_snapshots_obey_byte_budget_including_the_largest_buffer() {
+        let mut pool = vec![
+            Vec::with_capacity(16),
+            Vec::with_capacity(4),
+            Vec::with_capacity(4),
+        ];
+        super::trim_pool(&mut pool, 8);
+        assert_eq!(pool.iter().map(Vec::capacity).collect::<Vec<_>>(), [4, 4]);
+        super::trim_pool(&mut pool, 0);
+        assert!(pool.is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2216,7 +2241,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_memory());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {

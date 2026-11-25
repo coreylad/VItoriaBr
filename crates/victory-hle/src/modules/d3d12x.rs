@@ -49,6 +49,9 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+#[cfg(windows)]
+pub use victory_gpu::pipeline::{save_pipeline_cache, warm_compute_pipeline};
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

@@ -1280,6 +1280,12 @@ mod tests {
             }
 
             title_memory_section(section, K64 as u64, false);
+            let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                mem::VirtualQuery(cached_old_view.Value, &mut info, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()),
+                0
+            );
+            assert_eq!(info.State, mem::MEM_FREE, "the old cached view must be unmapped");
             assert!(write_own(new_view.Value as usize + 8, &[0x5a]).is_some());
             assert_eq!(*(new_view.Value as *const u8).add(8), 0x5a);
             assert_eq!(*(old_view.Value as *const u8).add(8), 0);

@@ -371,7 +371,7 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_memory());
     if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
@@ -610,7 +610,9 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // An offline warm-up has no title requests, but must preserve the previous
+    // run's early list instead of replacing it with an uninitialized empty set.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.

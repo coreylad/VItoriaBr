@@ -10,7 +10,8 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Changes to a single-layer tiled 2D texture detile only changed mips
+//! (packed tail mips are checked together); other layouts detile whole.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -135,6 +136,71 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    mips: Vec<Option<MipContent>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MipContent {
+    Zero,
+    Hash(blake3::Hash),
+}
+
+impl Last {
+    fn caches_mips(layout: &victory_formats::texture::Layout) -> bool {
+        use victory_formats::texture::{Dimension, Swizzle};
+        layout.desc.dimension == Dimension::Tex2d
+            && layout.slices == 1
+            && layout.desc.swizzle != Swizzle::LINEAR
+            && layout.addressable()
+    }
+
+    fn whole_hash(layout: &victory_formats::texture::Layout, tiled: &[u8]) -> Option<blake3::Hash> {
+        (!Self::caches_mips(layout)).then(|| blake3::hash(tiled))
+    }
+
+    fn detile(
+        &mut self,
+        layout: &victory_formats::texture::Layout,
+        tiled: &[u8],
+        (mip, slice): (u32, u32),
+        (linear, pitch, depth_pitch): (&mut [u8], usize, usize),
+        held: bool,
+    ) -> Result<bool, victory_formats::texture::Error> {
+        // Standard mips occupy disjoint runs, but packed mips can address
+        // bytes anywhere in their shared tail block.
+        let cacheable = Self::caches_mips(layout) && slice == 0;
+        if !cacheable {
+            if held {
+                layout.detile(tiled, mip, slice, linear, pitch, depth_pitch)?;
+            } else {
+                linear.fill(0);
+            }
+            return Ok(true);
+        }
+        let m = layout.mips.get(mip as usize).ok_or(victory_formats::texture::Error::Invalid)?;
+        let content = if !held {
+            MipContent::Zero
+        } else {
+            let (start, end) = if mip < layout.first_tail_mip {
+                (m.offset, if mip == 0 { layout.slice_size } else { layout.mips[mip as usize - 1].offset })
+            } else {
+                (0, layout.alignment.min(layout.slice_size))
+            };
+            let bytes = tiled.get(start as usize..end as usize).ok_or(victory_formats::texture::Error::TooSmall)?;
+            MipContent::Hash(blake3::hash(bytes))
+        };
+        self.mips.resize(layout.mips.len(), None);
+        if self.mips[mip as usize] == Some(content) {
+            return Ok(false);
+        }
+        if held {
+            layout.detile(tiled, mip, slice, linear, pitch, depth_pitch)?;
+        } else {
+            linear.fill(0);
+        }
+        self.mips[mip as usize] = Some(content);
+        Ok(true)
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -464,11 +530,29 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
+            let budget = crate::host::spare_budget(crate::host::available_memory(), SPARE_MOST.0);
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= budget {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }
+        }
+    }
+}
+
+pub(crate) fn trim_spares(budget: u64) {
+    let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    while all.1 > budget {
+        let Some(mut entry) = all.0.last_entry() else {
+            break;
+        };
+        let size = *entry.key();
+        let spare = entry.get_mut().pop();
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+        if spare.is_some() {
+            all.1 -= size;
         }
     }
 }
@@ -513,7 +597,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_memory());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -1000,7 +1084,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, last);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1062,16 +1146,15 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                let hash = Last::whole_hash(&self.layout, read);
+                if hash.is_some() && last.hash == hash {
                     return false;
                 }
-                last.hash = Some(hash);
+                last.hash = hash;
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
-                true
+                self.detile(read, last)
             });
             #[cfg(feature = "diagnostics")]
             if changed {
@@ -1082,32 +1165,34 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = Last::whole_hash(&self.layout, tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if hash.is_some() && last.hash == hash {
                     return size;
                 }
-                last.hash = Some(hash);
-                self.detile(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                last.hash = hash;
+                if self.detile(tiled, last) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                }
                 size
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = Last::whole_hash(&self.layout, tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if hash.is_some() && last.hash == hash {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        last.hash = hash;
+        if self.detile(tiled, last) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        }
         size
     }
 
@@ -1123,10 +1208,10 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
+            let hash = Last::whole_hash(&self.layout, read);
+            if hash.is_none() || last.hash != hash {
+                last.hash = hash;
+                self.detile(read, last);
             }
             true
         });
@@ -1141,8 +1226,7 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    fn detile(&self, tiled: &[u8], last: &mut Last) -> bool {
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1165,6 +1249,7 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let mut changed = false;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
@@ -1174,19 +1259,25 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if mip < 32 && held & (1 << mip) == 0 {
-                // Not the title's: zeros, not what lies in that memory.
-                linear.fill(0);
-                continue;
-            }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+            match last.detile(
+                &self.layout,
+                tiled,
+                (mip, slice),
+                (linear, pitch, pitch * rows as usize),
+                mip >= 32 || held & (1 << mip) != 0,
+            ) {
+                Ok(true) => {
+                    changed = true;
+                    self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(?e, mip, slice, "texture not detiled");
+                    return changed;
+                }
             }
         }
+        changed
     }
 }
 
@@ -1295,28 +1386,22 @@ fn by_query() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
 }
 
-/// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
-/// can be read, and how many there are; with `all`, it stops at the first
-/// that cannot. One question to the kernel for up to 256 pages at once
-/// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
-/// page not in the working set may still be there (never touched, or
-/// trimmed), and a one-byte read through the kernel says.
-/// A page that is committed and may not be read counts as not there, which
-/// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+/// Queries up to 256 page addresses at once, falling back to a read for
+/// pages outside the working set. `visit` returns false to stop early.
+fn readable_pages(
+    count: usize,
+    mut address: impl FnMut(usize) -> usize,
+    mut visit: impl FnMut(usize, bool) -> bool,
+) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
-    let of = last - first + 1;
-    let mut there = 0;
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
-    let mut page = first;
-    while page <= last {
-        let n = (last - page + 1).min(info.len());
+    let mut first = 0;
+    while first < count {
+        let n = (count - first).min(info.len());
         for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+            entry.VirtualAddress = address(first + i) as *mut _;
         }
         // SAFETY: `n` entries of the size given; our own process.
         let asked = unsafe {
@@ -1331,15 +1416,51 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
-                there += 1;
-            } else if all {
-                return (there, of);
+            let readable = valid || crate::host::read_into(entry.VirtualAddress.cast(), &mut byte);
+            if !visit(first + i, readable) {
+                return;
             }
         }
-        page += n;
+        first += n;
     }
+}
+
+/// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
+/// can be read, and how many there are; with `all`, it stops at the first
+/// that cannot. A page outside the working set may still be committed.
+fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    const KERNEL_PAGE: usize = 4096;
+    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
+    let of = last - first + 1;
+    let mut there = 0;
+    readable_pages(of, |i| (first + i) * KERNEL_PAGE, |_, present| {
+        if present {
+            there += 1;
+        }
+        present || !all
+    });
     (there, of)
+}
+
+/// Approximate mapped bytes by sampling one page per 64 KiB title block.
+fn mapped_by_blocks(start: usize, end: usize) -> u64 {
+    const BLOCK: usize = 64 << 10;
+    const KERNEL_PAGE: usize = 4096;
+    if start >= end {
+        return 0;
+    }
+    let first = start / BLOCK;
+    let count = (end - 1) / BLOCK - first + 1;
+    let mut there = 0u64;
+    readable_pages(count, |i| ((first + i) * BLOCK).max(start) / KERNEL_PAGE * KERNEL_PAGE, |i, present| {
+        if present {
+            let block = (first + i) * BLOCK;
+            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+            there += (hi - lo) as u64;
+        }
+        true
+    });
+    there
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -1390,17 +1511,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_by_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1504,7 +1615,179 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{Last, mapped_by_blocks, readable, with_title};
+
+    #[test]
+    fn detiling_reuses_unchanged_mips_and_refreshes_shared_tails() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        for swizzle in [Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 257,
+                height: 131,
+                depth: 1,
+                mips: 9,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            }).unwrap();
+            let mut tiled: Vec<u8> = (0..layout.size as usize).map(|i| (i * 7 + i / 251) as u8).collect();
+            let mut last = Last::default();
+            let mut outputs: Vec<Vec<u8>> = layout.mips.iter()
+                .map(|m| vec![0; m.width as usize * m.height as usize * 4])
+                .collect();
+            for pass in 0..5 {
+                let mut changed = Vec::new();
+                for (mip, output) in outputs.iter_mut().enumerate() {
+                    let m = &layout.mips[mip];
+                    let pitch = m.width as usize * 4;
+                    let held = pass != 3 || mip != 0;
+                    let len = output.len();
+                    if last.detile(&layout, &tiled, (mip as u32, 0), (output, pitch, len), held).unwrap() {
+                        changed.push(mip);
+                    }
+                    let mut reference = vec![0; output.len()];
+                    if held {
+                        layout.detile(&tiled, mip as u32, 0, &mut reference, pitch, output.len()).unwrap();
+                    }
+                    assert_eq!(*output, reference, "swizzle {swizzle:?}, pass {pass}, mip {mip}");
+                }
+                match pass {
+                    0 => assert_eq!(changed.len(), layout.mips.len()),
+                    1 => {
+                        assert!(changed.is_empty());
+                        let at = layout.offset(0, 0, 0, 0).unwrap() as usize;
+                        tiled[at] ^= 0xff;
+                    }
+                    2 => {
+                        assert_eq!(changed, [0]);
+                        let tail = layout.first_tail_mip;
+                        if tail < layout.mips.len() as u32 {
+                            let at = layout.offset(tail, 0, 0, 0).unwrap() as usize;
+                            tiled[at] ^= 0xff;
+                        }
+                    }
+                    3 => {
+                        let expected: Vec<usize> = std::iter::once(0)
+                            .chain(layout.first_tail_mip as usize..layout.mips.len()).collect();
+                        assert_eq!(changed, expected);
+                    }
+                    4 => assert_eq!(changed, [0], "a mip becoming held again must restore its bytes"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU texture refresh benchmark"]
+    fn measure_streamed_mip_detiling() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 2048,
+            height: 2048,
+            depth: 1,
+            mips: 12,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        }).unwrap();
+        let original: Vec<u8> = (0..layout.size as usize).map(|i| (i * 7 + i / 251) as u8).collect();
+        let make_outputs = || layout.mips.iter().map(|m| vec![0; m.width as usize * m.height as usize * 4]).collect::<Vec<_>>();
+        let mut baseline = make_outputs();
+        let mut cached = make_outputs();
+        let at = layout.offset(3, 0, 0, 0).unwrap() as usize;
+        let mut elapsed = Vec::new();
+        for selective in [false, true] {
+            let mut last = Last::default();
+            let mut tiled = original.clone();
+            let outputs = if selective { &mut cached } else { &mut baseline };
+            let began = std::time::Instant::now();
+            for frame in 0..32 {
+                tiled[at] = frame;
+                if !selective {
+                    std::hint::black_box(blake3::hash(&tiled));
+                }
+                for (mip, output) in outputs.iter_mut().enumerate() {
+                    let pitch = layout.mips[mip].width as usize * 4;
+                    let len = output.len();
+                    if selective {
+                        last.detile(&layout, &tiled, (mip as u32, 0), (output, pitch, len), true).unwrap();
+                    } else {
+                        layout.detile(&tiled, mip as u32, 0, output, pitch, len).unwrap();
+                    }
+                }
+            }
+            elapsed.push(began.elapsed());
+        }
+        assert_eq!(cached, baseline);
+        eprintln!("32 streamed mip refreshes: whole {:?}, selective {:?} ({:.2}x)", elapsed[0], elapsed[1], elapsed[0].as_secs_f64() / elapsed[1].as_secs_f64());
+    }
+
+    #[test]
+    fn batched_block_mapping_matches_individual_queries() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const BLOCKS: usize = 320;
+        const SIZE: usize = BLOCK * BLOCKS;
+        // SAFETY: this test owns the reservation and changes it only on
+        // this thread; only committed blocks are touched.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for block in 0..BLOCKS {
+                base.add(block * BLOCK).write(1);
+            }
+            for block in (1..BLOCKS).step_by(3) {
+                assert_ne!(VirtualFree(base.add(block * BLOCK).cast(), BLOCK, MEM_DECOMMIT), 0);
+            }
+            let reference = |start: usize, end: usize| {
+                let mut bytes = 0u64;
+                let mut block = start & !(BLOCK - 1);
+                while block < end {
+                    let lo = block.max(start);
+                    let hi = block.saturating_add(BLOCK).min(end);
+                    if readable(lo, 1, true).0 == 1 {
+                        bytes += (hi - lo) as u64;
+                    }
+                    block = block.saturating_add(BLOCK);
+                }
+                bytes
+            };
+            for (offset, len) in [
+                (17, BLOCK - 40),
+                (BLOCK - 17, 2 * BLOCK + 33),
+                (123, SIZE - 789),
+                (256 * BLOCK - 4096, 3 * BLOCK + 8192),
+            ] {
+                let start = base as usize + offset;
+                let expected: usize = (0..BLOCKS)
+                    .filter(|block| block % 3 != 1)
+                    .map(|block| {
+                        let lo = (block * BLOCK).max(offset);
+                        let hi = ((block + 1) * BLOCK).min(offset + len);
+                        hi.saturating_sub(lo)
+                    })
+                    .sum();
+                let actual = mapped_by_blocks(start, start + len);
+                assert_eq!(actual, expected as u64);
+                assert_eq!(actual, reference(start, start + len));
+            }
+            let start = base as usize + 123;
+            let before = mapped_by_blocks(start, start + SIZE - 789);
+            assert_eq!(readable(base as usize, 2 * BLOCK, true), (BLOCK / 4096, 2 * BLOCK / 4096));
+            let remapped = base.add(BLOCK);
+            assert_eq!(VirtualAlloc(remapped.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), remapped.cast());
+            remapped.write(1);
+            assert_eq!(mapped_by_blocks(start, start + SIZE - 789), before + BLOCK as u64);
+            assert_eq!(mapped_by_blocks(start, start + SIZE - 789), reference(start, start + SIZE - 789));
+            assert_eq!(mapped_by_blocks(start, start), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

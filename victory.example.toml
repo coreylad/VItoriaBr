@@ -6,14 +6,50 @@
 [paths]
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
+# Optional default executable for `victory run --execute`. env: VICTORY_GAME_EXE
+# game_exe = 'D:\victory-data\game\title.exe'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
+# Optional separate shader/pipeline cache; defaults to <cache_dir>\shaders.
+# env: VICTORY_SHADER_CACHE_DIR
+# shader_cache_dir = 'D:\victory-data\cache\shaders'
 
 # What titles save (persistent local storage), kept apart from the cache.
 # Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
+# Optional plain-text log, alongside console output. env: VICTORY_LOG_DIR
+# log_dir = 'D:\victory-data\logs'
+
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+# Runtime defaults, applied before logging and GPU initialization.
+# Values must be strings. Only uppercase VICTORY_* keys are accepted here;
+# VICTORY_CONFIG must be set outside the file. Existing environment wins.
+[environment]
+# VICTORY_RELAY = "2"
+# VICTORY_FRAME_LOG = "1"
+# VICTORY_LOG = "info"
+# VICTORY_TEXTURE_FAIR_QUEUE = "1"
+# VICTORY_PIPELINE_WAIT_SHARED = "1"
+# Cap the translation target for both warming and gameplay (32 or 64).
+# Never exceeds the GPU's actual maximum. Unsupported conversions are refused.
+# VICTORY_HOST_WAVE = "32"
+# Normal compatibility-first budgets; shortening them may defer textures
+# and skip pending draws rather than making the underlying work faster.
+# VICTORY_TEXTURE_CATCHUP = "1"
+# VICTORY_TEXTURE_STAGE_MS = "250"
+# Compute and graphics each share a 12-second loading window. "reserve" restores
+# the older reservation scheme; "0" counts waits independently per thread.
+# VICTORY_PIPELINE_WAIT_MS = "12000"
+# Uploads wait for overlapping GPU writes by default. Keep this for correctness;
+# "0" explicitly opts into speculative reads that can consume stale data.
+# VICTORY_FILL_WAIT = "1"
+# Expensive VRAM diagnostics; off unless investigating allocation pressure.
+# VICTORY_CARD_ACCOUNTING = "0"
+# Presence-only flags such as VICTORY_D3D12_WARP, VICTORY_D3D12_DEBUG,
+# VICTORY_D3D12_DRED and VICTORY_GPU_TIMING must be OMITTED to stay off;
+# setting them to "0" still enables them.

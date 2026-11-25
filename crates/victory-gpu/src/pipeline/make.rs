@@ -12,8 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! Loading uses a shared wall-clock window per pipeline kind, as in
+//! DexNom/VIctory: recording threads wait together instead of reserving away
+//! each other's budget. One-time compute loading passes get their own window.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -96,15 +97,28 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_BUDGET.get() {
+        return budget;
+    }
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
+            .unwrap_or(DEFAULT_WAIT_MS);
+        tracing::info!(millis, "host pipeline wait window per frame, per kind");
         Duration::from_millis(millis)
     })
+}
+
+// Two sequential windows leave room below the title's 30-second watchdog.
+const DEFAULT_WAIT_MS: u64 = 12_000;
+const _: () = assert!(2 * DEFAULT_WAIT_MS < 30_000);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BUDGET: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 /// Pipelines queued and not made yet.
@@ -146,48 +160,75 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Whether the frame's budget is one for all threads together: a thread
-/// that waits takes what is left of it and gives back what it did not
-/// use. Counted only when a wait had ended, the budget was one per thread:
-/// each of the title's five recording threads began its first wait of a
-/// frame with nothing counted yet and waited the whole half second, 2.5 s
-/// of waiting in every frame in which pipelines were being made (runs
-/// 34-49: "2504 ms waiting for pipelines" in each such frame).
-/// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
-fn shared_budget() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+fn shared_budget() -> Sharing {
+    static MODE: OnceLock<Sharing> = OnceLock::new();
+    *MODE.get_or_init(|| sharing_from(std::env::var("VICTORY_PIPELINE_WAIT_SHARED").ok().as_deref()))
 }
 
-#[derive(Default)]
-struct WaitBudget {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sharing {
+    Window,
+    Reserve,
+    PerThread,
+}
+
+fn sharing_from(value: Option<&str>) -> Sharing {
+    match value.map(str::trim) {
+        Some("0") => Sharing::PerThread,
+        Some("reserve") => Sharing::Reserve,
+        _ => Sharing::Window,
+    }
+}
+
+struct FrameWait {
     frame: Option<u64>,
     spent: Duration,
+    waiting: u32,
+    since: Option<Instant>,
 }
 
-impl WaitBudget {
-    fn claim(&mut self, frame: u64, budget: Duration, shared: bool) -> Duration {
+impl FrameWait {
+    const fn new() -> Self {
+        Self { frame: None, spent: Duration::ZERO, waiting: 0, since: None }
+    }
+
+    fn begin(&mut self, sharing: Sharing, frame: u64, budget: Duration, now: Instant) -> Duration {
         match self.frame {
             Some(current) if frame < current => return Duration::ZERO,
             Some(current) if frame == current => {}
             _ => {
-                self.frame = Some(frame);
-                self.spent = Duration::ZERO;
+                *self = Self { frame: Some(frame), ..Self::new() };
             }
         }
+        if sharing == Sharing::Window {
+            let open = self.since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            let left = budget.saturating_sub(self.spent + open);
+            if !left.is_zero() {
+                if self.waiting == 0 {
+                    self.since = Some(now);
+                }
+                self.waiting += 1;
+            }
+            return left;
+        }
         let left = budget.saturating_sub(self.spent);
-        if shared {
+        if sharing == Sharing::Reserve {
             self.spent += left;
         }
         left
     }
 
-    fn finish(&mut self, frame: u64, shared: bool, reserved: Duration, waited: Duration) {
+    fn end(&mut self, sharing: Sharing, frame: u64, reserved: Duration, waited: Duration, now: Instant) {
         if self.frame == Some(frame) {
-            if shared {
-                self.spent = self.spent.saturating_sub(reserved - waited);
-            } else {
-                self.spent += waited;
+            match sharing {
+                Sharing::Window => {
+                    self.waiting = self.waiting.saturating_sub(1);
+                    if self.waiting == 0 && let Some(at) = self.since.take() {
+                        self.spent += now.saturating_duration_since(at);
+                    }
+                }
+                Sharing::Reserve => self.spent = self.spent.saturating_sub(reserved.saturating_sub(waited)),
+                Sharing::PerThread => self.spent += waited,
             }
         }
     }
@@ -199,21 +240,18 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<WaitBudget> = Mutex::new(WaitBudget {
-        frame: None,
-        spent: Duration::ZERO,
-    });
+    static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
+    let compute = p.shaders.iter().any(|s| s.stage == "compute");
+    let frame_wait = &FRAMES[usize::from(compute)];
     let shared = shared_budget();
+    let started = Instant::now();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        spent.claim(frame, budget, shared)
+        let mut spent = frame_wait.lock().unwrap_or_else(|e| e.into_inner());
+        spent.begin(shared, frame, budget, started)
     };
     if left.is_zero() {
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -226,8 +264,8 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        spent.finish(frame, shared, left, waited);
+        let mut spent = frame_wait.lock().unwrap_or_else(|e| e.into_inner());
+        spent.end(shared, frame, left, waited, Instant::now());
     }
     crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
@@ -412,29 +450,54 @@ mod tests {
 
     #[test]
     fn stale_frame_cannot_reset_or_refund_a_newer_frames_wait_budget() {
-        let mut spent = WaitBudget::default();
+        let mut spent = FrameWait::new();
         let budget = Duration::from_millis(500);
         let waited = Duration::from_millis(100);
-        assert_eq!(spent.claim(1, budget, true), budget);
-        assert_eq!(spent.claim(2, budget, true), budget);
-        assert_eq!(spent.claim(1, budget, true), Duration::ZERO);
-        spent.finish(1, true, budget, waited);
-        assert_eq!(spent.claim(2, budget, true), Duration::ZERO);
-        spent.finish(2, true, budget, waited);
-        assert_eq!(spent.claim(2, budget, true), budget - waited);
+        let now = Instant::now();
+        for sharing in [Sharing::Window, Sharing::Reserve, Sharing::PerThread] {
+            assert_eq!(spent.begin(sharing, 1, budget, now), budget);
+            assert_eq!(spent.begin(sharing, 2, budget, now), budget);
+            assert_eq!(spent.begin(sharing, 1, budget, now), Duration::ZERO);
+            spent.end(sharing, 1, budget, waited, now + waited);
+            assert_eq!(spent.frame, Some(2));
+            spent.end(sharing, 2, budget, waited, now + waited);
+            assert_eq!(spent.begin(sharing, 2, budget, now + waited), budget - waited);
+            spent = FrameWait::new();
+        }
     }
 
     #[test]
     fn unshared_budget_counts_completed_waits_and_ignores_stale_frames() {
-        let mut spent = WaitBudget::default();
+        let mut spent = FrameWait::new();
         let budget = Duration::from_millis(500);
         let waited = Duration::from_millis(125);
-        assert_eq!(spent.claim(4, budget, false), budget);
-        spent.finish(4, false, budget, waited);
-        assert_eq!(spent.claim(5, budget, false), budget);
-        spent.finish(4, false, budget, waited);
-        assert_eq!(spent.claim(4, budget, false), Duration::ZERO);
-        assert_eq!(spent.claim(5, budget, false), budget);
+        let now = Instant::now();
+        assert_eq!(spent.begin(Sharing::PerThread, 4, budget, now), budget);
+        spent.end(Sharing::PerThread, 4, budget, waited, now + waited);
+        assert_eq!(spent.begin(Sharing::PerThread, 5, budget, now + waited), budget);
+        spent.end(Sharing::PerThread, 4, budget, waited, now + waited);
+        assert_eq!(spent.begin(Sharing::PerThread, 4, budget, now + waited), Duration::ZERO);
+        assert_eq!(spent.begin(Sharing::PerThread, 5, budget, now + waited), budget);
+    }
+
+    #[test]
+    fn concurrent_loading_threads_share_elapsed_time_instead_of_reserving_it() {
+        let mut spent = FrameWait::new();
+        let now = Instant::now();
+        let budget = Duration::from_secs(12);
+        let ms = Duration::from_millis;
+        let sharing = sharing_from(Some("1"));
+        let a = spent.begin(sharing, 7, budget, now);
+        let b = spent.begin(sharing, 7, budget, now + ms(1));
+        assert_eq!(a, budget);
+        assert_eq!(b, budget - ms(1));
+        spent.end(sharing, 7, a, ms(2000), now + ms(2000));
+        spent.end(sharing, 7, b, ms(1999), now + ms(2000));
+        let c = spent.begin(sharing, 7, budget, now + ms(5000));
+        assert_eq!(c, ms(10_000), "overlapping waits count only once; idle time is free");
+        spent.end(sharing, 7, c, c, now + ms(15_000));
+        assert_eq!(spent.begin(sharing, 7, budget, now + ms(16_000)), Duration::ZERO);
+        assert_eq!(spent.begin(sharing, 8, budget, now + ms(17_000)), budget);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -459,8 +522,10 @@ mod tests {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         let p = Arc::new(p);
 
+        let previous = TEST_BUDGET.replace(Some(Duration::ZERO));
         assert!(!super::super::library::wanted_early(&p.key));
         assert!(ready(&p).is_none());
+        TEST_BUDGET.set(previous);
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }

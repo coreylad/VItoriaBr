@@ -78,6 +78,24 @@ impl std::fmt::Debug for Shader {
     }
 }
 
+impl Shader {
+    fn new(stage: &'static str, hash: String, bytes: &[u8]) -> Self {
+        Self {
+            stage,
+            hash,
+            container: bytes.to_vec(),
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+            #[cfg(windows)]
+            walks: OnceLock::new(),
+            #[cfg(windows)]
+            resolves_light: bytes
+                .windows(crate::ambient::PROGRAM.len())
+                .any(|w| w == crate::ambient::PROGRAM),
+        }
+    }
+}
+
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
@@ -114,21 +132,28 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-                #[cfg(windows)]
-                walks: OnceLock::new(),
-                #[cfg(windows)]
-                resolves_light: bytes
-                    .windows(crate::ambient::PROGRAM.len())
-                    .any(|w| w == crate::ambient::PROGRAM),
-            })
+            Arc::new(Shader::new(stage, full.to_hex()[..16].to_owned(), bytes))
         })
         .clone()
+}
+
+/// Warms a compute PSO through the runtime's pipeline library, without dispatching
+/// it. Graphics shaders return `None`: their pipelines need title-provided state.
+#[cfg(windows)]
+pub fn warm_compute_pipeline(container: &[u8]) -> Result<Option<bool>, String> {
+    let translated = translate(container)?;
+    if translated.host.stage != victory_shader::HwStage::Cs {
+        return Ok(None);
+    }
+    // Unlike the title's shader table, this temporary shader does not retain
+    // every archive container for the lifetime of the offline warmer.
+    let mut shader = Shader::new(
+        "compute",
+        blake3::hash(container).to_hex()[..16].to_owned(),
+        container,
+    );
+    shader.translated = OnceLock::from(Some(translated));
+    Ok(Some(host::HostPipeline::new(&[Arc::new(shader)], None).is_some()))
 }
 
 /// A translated shader and the console resources its code reads.
@@ -849,6 +874,11 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    tracing::info!(
+        made = library::MADE.load(std::sync::atomic::Ordering::Relaxed),
+        loaded = library::LOADED.load(std::sync::atomic::Ordering::Relaxed),
+        "host pipeline cache totals"
+    );
 }
 
 #[cfg(test)]

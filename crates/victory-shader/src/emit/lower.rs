@@ -373,6 +373,35 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     Some(all)
 }
 
+/// Blocks that must be reached by both warps before using group barriers.
+/// A divergent loop-limit return can otherwise strand the other warp,
+/// even when the exchange itself lies outside the loop.
+pub(super) fn barrier_needs(p: &crate::ir::Program, st: &Structured) -> Option<Vec<usize>> {
+    let all = all_lane_blocks(st)?;
+    let mut place = vec![usize::MAX; p.blocks.len()];
+    for (n, b) in crate::ir::reverse_postorder(&p.blocks).into_iter().enumerate() {
+        place[b] = n;
+    }
+    Some(
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| place[*b] != usize::MAX && !all[*b])
+            .filter(|(b, block)| {
+                matches!(st.exits[*b], LaneExit::End)
+                    || matches!(st.exits[*b], LaneExit::Jump(t) if place[t] <= place[*b])
+                    || block.insts.iter().any(|i| {
+                        i.name() == "s_barrier"
+                            || matches!(i.fields, Fields::Ds { .. })
+                                && !i.name().starts_with("ds_swizzle")
+                                && !i.name().contains("permute")
+                    })
+            })
+            .map(|(b, _)| b)
+            .collect(),
+    )
+}
+
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
